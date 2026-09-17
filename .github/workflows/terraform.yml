@@ -1,0 +1,104 @@
+name: Terraform AWS EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "create (cria a EC2) ou delete (destroi a EC2)"
+        type: choice
+        required: true
+        default: create
+        options:
+          - create
+          - delete
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  id-token: write # autenticacao OIDC na AWS
+
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Tag de controle: dispatch usa o input; PR roda apenas plan com "create".
+  TF_VAR_action: ${{ github.event_name == 'workflow_dispatch' && inputs.action || 'create' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform:
+    name: "terraform (${{ github.event_name == 'workflow_dispatch' && inputs.action || 'plan' }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-terraform-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Configurar credenciais AWS (access keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.3"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY || 'infra-aws-terraform/ec2/terraform.tfstate' }}" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        run: |
+          set -eo pipefail
+          terraform plan -no-color -out=tfplan | tee plan.txt
+          {
+            echo "### Terraform plan (action=${TF_VAR_action})"
+            echo '```terraform'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Aplica apenas no disparo manual; PR fica so no plan.
+      - name: Terraform apply
+        if: github.event_name == 'workflow_dispatch'
+        run: terraform apply -no-color -auto-approve tfplan
+
+      - name: Outputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "### Outputs"
+            echo '```json'
+            terraform output -json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
